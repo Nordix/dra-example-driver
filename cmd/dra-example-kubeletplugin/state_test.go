@@ -17,6 +17,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -237,4 +239,72 @@ func TestComputeDeviceConfigSharedDeviceContainerEdits(t *testing.T) {
 	}
 	assert.Equal(t, "1", consumedByShare["share-0"], "share-0 should keep its own consumed CPU edit")
 	assert.Equal(t, "3", consumedByShare["share-1"], "share-1 should keep its own consumed CPU edit")
+}
+
+// TestUnprepareReturnsErrorOnUnreadableCheckpoint verifies that Unprepare returns an error
+// (rather than panicking) when checkpoint.json exists but cannot be decoded.
+// The fix returns the error immediately without touching the checkpoint, letting
+// the kubelet retry once the operator has corrected the file.
+func TestUnprepareReturnsErrorOnUnreadableCheckpoint(t *testing.T) {
+	const (
+		nodeName   = "test-node"
+		driverName = "cpu.example.com"
+		claimUID   = "some-claim-uid"
+	)
+
+	// t.TempDir() is used for both CDI files and the checkpoint directory so
+	// the test stays fully self-contained and cleans up automatically.
+	tmpDir := t.TempDir()
+
+	flags := &Flags{
+		cdiRoot:                     tmpDir,
+		driverName:                  driverName,
+		profile:                     "cpu",
+		nodeName:                    nodeName,
+		cpuNUMANodes:                1,
+		cpusPerNUMANode:             4,
+		kubeletPluginsDirectoryPath: tmpDir,
+	}
+
+	state, err := NewDeviceState(&Config{
+		flags:   flags,
+		profile: cpu.NewProfile(nodeName, driverName, flags.cpuNUMANodes, flags.cpusPerNUMANode),
+	})
+	require.NoError(t, err)
+
+	// The plugin directory must exist before writing files (NewDeviceState does
+	// not create it; that is done by RunPlugin at startup).
+	pluginDir := filepath.Join(tmpDir, driverName)
+	require.NoError(t, os.MkdirAll(pluginDir, 0750))
+
+	// create a CDI spec file for the claim, simulating a claim that was fully
+	// prepared before the checkpoint was corrupted. After Unprepare returns an
+	// error the file must still be present — nothing should have been released.
+	cdiSpecPath := filepath.Join(tmpDir, "k8s.cpu.example.com-cpu-"+claimUID+"-0.yaml")
+	require.NoError(t, os.WriteFile(cdiSpecPath, []byte("placeholder"), 0600))
+
+	// Write garbage bytes to the checkpoint file so that readCheckpoint returns
+	// (nil, err) — the exact precondition that triggered the nil dereference.
+	corruptData := []byte("THIS IS NOT VALID CHECKPOINT JSON")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(pluginDir, DriverPluginCheckpointFile),
+		corruptData,
+		0600,
+	))
+
+	// 1. Unprepare must return an error, not panic.
+	err = state.Unprepare(types.UID(claimUID))
+	require.Error(t, err, "Unprepare must return an error on an unreadable checkpoint")
+	assert.Contains(t, err.Error(), "unable to read checkpoint")
+
+	// 2. The corrupt file must be left exactly as it was — the driver must not
+	// overwrite it, preserving evidence and avoiding silent data loss.
+	data, readErr := os.ReadFile(state.checkpointPath)
+	require.NoError(t, readErr)
+	assert.Equal(t, corruptData, data, "corrupt checkpoint file must not be modified by Unprepare")
+
+	// 3. The CDI spec file for the claim must still be present — Unprepare
+	// must not release anything when it cannot read the checkpoint.
+	_, statErr := os.Stat(cdiSpecPath)
+	assert.NoError(t, statErr, "CDI spec file must still be present after Unprepare returns an error")
 }

@@ -195,9 +195,12 @@ func (s *DeviceState) Unprepare(claimUID types.UID) error {
 
 	checkpoint, err := readCheckpoint(s.checkpointPath, s.checkpointDecoder)
 	if err != nil {
-		if err := writeCheckpoint(s.checkpointPath, s.checkpointEncoder, new(checkpointapi.Checkpoint)); err != nil {
-			return fmt.Errorf("unable to create new checkpoint: %v", err)
-		}
+		// The checkpoint file exists but cannot be read or decoded. Return the
+		// error and let the kubelet retry rather than attempting any recovery.
+		// Writing a new checkpoint here would silently discard records of all
+		// other currently-prepared claims, and we cannot safely act on an
+		// unknown state.
+		return fmt.Errorf("unable to read checkpoint: %w", err)
 	}
 
 	if err := s.unprepareDevices(claimUID, checkpoint); err != nil {
