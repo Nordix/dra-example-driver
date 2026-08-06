@@ -197,9 +197,17 @@ func (s *DeviceState) Unprepare(claimUID types.UID) error {
 	if err != nil {
 		// The checkpoint file exists but cannot be read or decoded. Return the
 		// error and let the kubelet retry rather than attempting any recovery.
-		// Writing a new checkpoint here would silently discard records of all
-		// other currently-prepared claims, and we cannot safely act on an
-		// unknown state.
+		//
+		// Deleting the file is not a way out: readCheckpoint treats a missing file
+		// as an empty checkpoint, so removing it writes off the records of every
+		// other prepared claim just as writing a new one would.
+		//
+		// This driver keeps only a prepared marker, because computeDeviceConfig
+		// rebuilds the CDI data from ResourceClaim.status.allocation and the
+		// devices this driver currently has. A fork that produces state during
+		// Prepare that it cannot rebuild afterwards, such as a MIG instance or a
+		// virtual function it later has to release, needs that state in the
+		// checkpoint for Unprepare to act on.
 		return fmt.Errorf("unable to read checkpoint: %w", err)
 	}
 
