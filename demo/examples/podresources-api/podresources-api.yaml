@@ -1,0 +1,45 @@
+# Example: Query PodResources API to see DRA-allocated devices
+# This example demonstrates KEP-3695 which extends the kubelet PodResources gRPC API
+# to include resources allocated by DRA drivers (Beta in 1.34, Stable in 1.36)
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: podresources-api
+
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: podresources-api
+  name: gpu-claim
+spec:
+  spec:
+    devices:
+      requests:
+      - name: gpu
+        exactly:
+          deviceClassName: gpu.example.com
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: podresources-api
+  name: workload-pod
+  labels:
+    app: workload
+spec:
+  containers:
+  - name: workload
+    image: ubuntu:22.04
+    command: ["bash", "-c"]
+    args: ["echo 'Workload running with DRA GPU'; export; trap 'exit 0' TERM; sleep 9999 & wait"]
+    resources:
+      claims:
+      - name: gpu
+  resourceClaims:
+  - name: gpu
+    resourceClaimTemplateName: gpu-claim
+
