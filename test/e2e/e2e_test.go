@@ -400,6 +400,22 @@ var _ = Describe("Test GPU allocation", func() {
 		Expect(shares[1].shareID).NotTo(BeEmpty(), "second allocation should have a ShareID")
 		Expect(shares[0].shareID).NotTo(Equal(shares[1].shareID), "shared allocations must have distinct ShareIDs")
 	})
+	It("should expose DRA resources via PodResources API", func(ctx SpecContext) {
+		drv := installDriver(ctx, DriverConfig{})
+		namespace := "podresources-api"
+		pods := []string{"workload-pod"}
+		containerName := "workload"
+		expectedGPUCount := 1
+
+		deployManifest(ctx, namespace, "podresources-api.yaml", drv)
+		checkPodsReadyAndRunning(ctx, namespace, pods)
+
+		observedGPUs := make(map[string]string)
+		verifyGPUAllocation(ctx, namespace, pods[0], containerName, expectedGPUCount, observedGPUs)
+
+		// Query PodResources API to verify DRA resources are exposed
+		verifyPodResourcesAPI(ctx, namespace, pods[0], containerName, drv.DriverName)
+	})
 
 	// Webhook tests share one driver pinned to "gpu.example.com" so their
 	// static testdata stays valid; Ordered+Serial avoids concurrent upgrades.

@@ -46,14 +46,19 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/utils/ptr"
 )
 
-var rootDir, demoManifestsDir string
-var clientset *kubernetes.Clientset
-var dynamicClient dynamic.Interface
-var restMapper meta.RESTMapper
+var (
+	config                    *rest.Config
+	rootDir, demoManifestsDir string
+	clientset                 *kubernetes.Clientset
+	dynamicClient             dynamic.Interface
+	restMapper                meta.RESTMapper
+)
 
 // driverPodSelector finds kubelet plugin Pods within an installed driver's release namespace.
 const driverPodSelector = "app.kubernetes.io/component=kubeletplugin"
@@ -113,7 +118,8 @@ var _ = BeforeSuite(func(ctx SpecContext) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	configOverrides := &clientcmd.ConfigOverrides{}
 	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
-	config, err := kubeConfig.ClientConfig()
+	var err error
+	config, err = kubeConfig.ClientConfig()
 	Expect(err).NotTo(HaveOccurred())
 
 	clientset, err = kubernetes.NewForConfig(config)
@@ -993,4 +999,135 @@ func verifyGPUConsumedCapacity(ctx context.Context, namespace, driverName string
 		g.Expect(seenShareIDs).To(HaveLen(len(pods.Items)),
 			"expected %d distinct ShareIDs, got %v", len(pods.Items), seenShareIDs)
 	}, checkPodLogsTimeout, checkPodLogsInterval).Should(Succeed())
+}
+
+// verifyPodResourcesAPI queries the kubelet PodResources API and verifies that
+// DRA-allocated devices are exposed (KEP-3695).
+func verifyPodResourcesAPI(ctx context.Context, namespace, podName, containerName, driverName string) {
+	GinkgoHelper()
+
+	pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	Expect(err).NotTo(HaveOccurred(), "Failed to get pod %s/%s", namespace, podName)
+	nodeName := pod.Spec.NodeName
+	Expect(nodeName).NotTo(BeEmpty(), "Pod %s/%s has no node assigned", namespace, podName)
+
+	fmt.Fprintf(GinkgoWriter, "Querying PodResources API on node %s for pod %s/%s\n",
+		nodeName, namespace, podName)
+
+	serverVersion, err := clientset.Discovery().ServerVersion()
+	Expect(err).NotTo(HaveOccurred(), "Failed to get server version")
+	k8sVersion := serverVersion.GitVersion
+	debugPodName := "podresources-debug-" + podName
+	hostPathDir := v1.HostPathDirectory
+
+	// Run grpcurl directly inside the container entrypoint
+	debugPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      debugPodName,
+			Namespace: namespace,
+		},
+		Spec: v1.PodSpec{
+			NodeName:      nodeName,
+			HostNetwork:   true,
+			HostPID:       true,
+			RestartPolicy: v1.RestartPolicyNever,
+			InitContainers: []v1.Container{
+				{
+					Name:  "download-proto",
+					Image: "curlimages/curl:latest",
+					Command: []string{
+						"sh", "-c",
+						fmt.Sprintf("mkdir -p /tmp/podresources && curl -sSL https://raw.githubusercontent.com/kubernetes/kubernetes/%s/staging/src/k8s.io/kubelet/pkg/apis/podresources/v1/api.proto -o /tmp/podresources/api.proto", k8sVersion),
+					},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      "proto-dir",
+							MountPath: "/tmp/podresources",
+						},
+					},
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name:  "query",
+					Image: "fullstorydev/grpcurl:latest",
+					Args: []string{
+						"-plaintext",
+						"-import-path", "/tmp/podresources",
+						"-proto", "/tmp/podresources/api.proto",
+						"unix:///var/lib/kubelet/pod-resources/kubelet.sock",
+						"v1.PodResourcesLister/List",
+					},
+					SecurityContext: &v1.SecurityContext{
+						Privileged: func() *bool { b := true; return &b }(),
+						RunAsUser:  ptr.To(int64(0)), // Force root user
+						RunAsGroup: ptr.To(int64(0)),
+					},
+					VolumeMounts: []v1.VolumeMount{
+						{
+							Name:      "pod-resources",
+							MountPath: "/var/lib/kubelet/pod-resources",
+							ReadOnly:  true,
+						},
+						{
+							Name:      "proto-dir",
+							MountPath: "/tmp/podresources",
+						},
+					},
+				},
+			},
+			Volumes: []v1.Volume{
+				{
+					Name: "pod-resources",
+					VolumeSource: v1.VolumeSource{
+						HostPath: &v1.HostPathVolumeSource{
+							Path: "/var/lib/kubelet/pod-resources",
+							Type: &hostPathDir,
+						},
+					},
+				},
+				{
+					Name: "proto-dir",
+					VolumeSource: v1.VolumeSource{
+						EmptyDir: &v1.EmptyDirVolumeSource{},
+					},
+				},
+			},
+		},
+	}
+
+	_, err = clientset.CoreV1().Pods(namespace).Create(ctx, debugPod, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred(), "Failed to create debug pod")
+
+	DeferCleanup(func(cleanupCtx context.Context) {
+		deletePolicy := metav1.DeletePropagationForeground
+		err := clientset.CoreV1().Pods(namespace).Delete(cleanupCtx, debugPodName, metav1.DeleteOptions{
+			PropagationPolicy: &deletePolicy,
+		})
+		if err != nil && !apierrors.IsNotFound(err) {
+			fmt.Fprintf(GinkgoWriter, "Warning: failed to delete debug pod %s/%s: %v\n",
+				namespace, debugPodName, err)
+		}
+	})
+	// Wait for the query pod to complete (Succeeded phase)
+	Eventually(func(g Gomega) {
+		p, err := clientset.CoreV1().Pods(namespace).Get(ctx, debugPodName, metav1.GetOptions{})
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(p.Status.Phase).To(Equal(v1.PodSucceeded), "Debug pod failed or is still running")
+	}, "60s", "2s").Should(Succeed())
+
+	// Retrieve the pod logs to inspect the JSON output from grpcurl
+	req := clientset.CoreV1().Pods(namespace).GetLogs(debugPodName, &v1.PodLogOptions{})
+	logs, err := req.DoRaw(ctx)
+	Expect(err).NotTo(HaveOccurred(), "Failed to get logs from debug pod")
+
+	output := string(logs)
+
+	// Validate KEP-3695 properties in the returned JSON
+	Expect(output).To(ContainSubstring(podName), "Target pod name missing from response")
+	Expect(output).To(ContainSubstring(containerName), "Target container name missing from response")
+	Expect(output).To(ContainSubstring("dynamicResources"), "Container has no dynamicResources")
+	Expect(output).To(ContainSubstring(driverName), "Driver %s not found under dynamicResources", driverName)
+
+	fmt.Fprintf(GinkgoWriter, "✓ PodResources API successfully verified via pod logs:\n%s\n", output)
 }
