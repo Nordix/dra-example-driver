@@ -43,11 +43,10 @@ graph TD
 - **GPUs**: 2
 
 ### Cluster Requirements
-- Kubernetes 1.36+
-- API: `scheduling.k8s.io/v1alpha2` enabled
+- Kubernetes 1.37+
+- API: `scheduling.k8s.io/v1beta1` enabled
 - Feature gates:
-  - `GenericWorkload`
-  - `GangScheduling`
+  - `GenericWorkload` (includes gang scheduling since 1.37)
   - `DRAWorkloadResourceClaims`
 
 ## How to Run

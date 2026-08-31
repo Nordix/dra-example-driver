@@ -77,8 +77,13 @@ func (p Profile) EnumerateDevices() (resourceslice.DriverResources, error) {
 			Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
 				capacityKey: {Value: *resource.NewQuantity(int64(p.cpusPerNUMANode), resource.DecimalSI)},
 			},
-			NodeAllocatableResourceMappings: map[corev1.ResourceName]resourceapi.NodeAllocatableResourceMapping{
-				corev1.ResourceCPU: {CapacityKey: &capacityKey},
+			NodeAllocatableResources: map[corev1.ResourceName]resourceapi.NodeAllocatableResource{
+				corev1.ResourceCPU: {
+					Mapping: &resourceapi.NodeAllocatableMapping{
+						CapacityKey:        &capacityKey,
+						CapacityMultiplier: resource.NewQuantity(1, resource.DecimalSI),
+					},
+				},
 			},
 		}
 	}
