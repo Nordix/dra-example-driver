@@ -47,7 +47,7 @@ fi
 
 # The kubernetes tag to build the kind cluster from
 # From ${KIND_K8S_REPO}/tags
-: ${KIND_K8S_TAG:="v1.36.1"}
+: ${KIND_K8S_TAG:="v1.37.0"}
 
 # The name of the kind cluster to create
 : ${KIND_CLUSTER_NAME:="${DRIVER_NAME}-cluster"}

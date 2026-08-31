@@ -32,8 +32,12 @@ import (
 func TestRestClientMetricsRegistered(t *testing.T) {
 	t.Parallel()
 
-	// Gauge metrics from the restclient package are exported as soon as the
-	// package is linked via kubeclient.go's blank import.
+	// Since Kubernetes 1.37, the restclient package linked via kubeclient.go's
+	// blank import registers its metrics lazily on first REST client
+	// construction rather than at link time.
+	_, err := coreclientset.NewForConfig(&rest.Config{Host: "https://localhost"})
+	require.NoError(t, err)
+
 	require.True(t, hasMetricFamily(t, "rest_client_transport_cache_entries"))
 }
 

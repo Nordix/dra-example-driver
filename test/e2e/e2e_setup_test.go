@@ -520,17 +520,23 @@ func verifyNodeAllocatableResourceClaimStatus(ctx context.Context, namespace, po
 			namespace, podName, generatedClaimName, containerName, matched.Containers)
 
 		for resourceName, expected := range expectedResources {
-			actual, ok := matched.Resources[resourceName]
-			g.Expect(ok).To(BeTrue(),
-				"Pod %s/%s nodeAllocatableResourceClaimStatuses entry for claim %q has no %s resource: %+v",
-				namespace, podName, generatedClaimName, resourceName, matched.Resources)
+			mappingIdx := slices.IndexFunc(matched.Mapping, func(m v1.NodeAllocatableMappedResources) bool {
+				return m.Name == resourceName
+			})
+			g.Expect(mappingIdx).NotTo(Equal(-1),
+				"Pod %s/%s nodeAllocatableResourceClaimStatuses entry for claim %q has no %s mapping: %+v",
+				namespace, podName, generatedClaimName, resourceName, matched.Mapping)
+			actual := matched.Mapping[mappingIdx].Quantity
+			g.Expect(actual).NotTo(BeNil(),
+				"Pod %s/%s claim %q mapping for %s has no quantity",
+				namespace, podName, generatedClaimName, resourceName)
 			g.Expect(actual.Cmp(expected)).To(BeZero(),
 				"Pod %s/%s claim %q resource %s: got %s, want %s",
 				namespace, podName, generatedClaimName, resourceName, actual.String(), expected.String())
 		}
 
 		fmt.Fprintf(GinkgoWriter, "Pod %s/%s claim %q has nodeAllocatableResourceClaimStatus %+v for container %s\n",
-			namespace, podName, generatedClaimName, matched.Resources, containerName)
+			namespace, podName, generatedClaimName, matched.Mapping, containerName)
 	}, checkPodLogsTimeout, checkPodLogsInterval).Should(Succeed())
 }
 
@@ -623,15 +629,15 @@ func verifyChosenSubrequest(ctx context.Context, namespace, podName, podLocalCla
 }
 
 // expectedMapping describes the asserted shape of a single
-// NodeAllocatableResourceMapping. Exactly one of AllocationMultiplier and
+// NodeAllocatableResource mapping. Exactly one of DeviceMultiplier and
 // CapacityKey should be set; whichever is set is what the helper asserts.
 type expectedMapping struct {
-	AllocationMultiplier *resource.Quantity
-	CapacityKey          *resourceapi.QualifiedName
+	DeviceMultiplier *resource.Quantity
+	CapacityKey      *resourceapi.QualifiedName
 }
 
 // waitForResourceSlicesWithNodeAllocatableMappings waits until every device
-// published by driverName carries NodeAllocatableResourceMappings matching
+// published by driverName carries NodeAllocatableResources mappings matching
 // expected. Closes the race between driver install and ResourceSlice publication.
 func waitForResourceSlicesWithNodeAllocatableMappings(ctx context.Context, driverName string, expected map[v1.ResourceName]expectedMapping) {
 	GinkgoHelper()
@@ -646,31 +652,33 @@ func waitForResourceSlicesWithNodeAllocatableMappings(ctx context.Context, drive
 		var matched int
 		for _, slice := range slices.Items {
 			for _, device := range slice.Spec.Devices {
-				mappings := device.NodeAllocatableResourceMappings
-				g.Expect(mappings).NotTo(BeNil(),
-					"device %q in slice %q has no NodeAllocatableResourceMappings", device.Name, slice.Name)
+				resources := device.NodeAllocatableResources
+				g.Expect(resources).NotTo(BeNil(),
+					"device %q in slice %q has no NodeAllocatableResources", device.Name, slice.Name)
 
 				for resourceName, exp := range expected {
-					m, ok := mappings[resourceName]
-					g.Expect(ok).To(BeTrue(), "device %q missing %s mapping", device.Name, resourceName)
+					r, ok := resources[resourceName]
+					g.Expect(ok).To(BeTrue(), "device %q missing %s resource", device.Name, resourceName)
+					g.Expect(r.Mapping).NotTo(BeNil(), "device %q %s resource has no mapping", device.Name, resourceName)
+					m := r.Mapping
 					switch {
-					case exp.AllocationMultiplier != nil:
-						g.Expect(m.AllocationMultiplier).NotTo(BeNil(), "device %q %s mapping has no AllocationMultiplier", device.Name, resourceName)
-						g.Expect(m.AllocationMultiplier.Cmp(*exp.AllocationMultiplier)).To(BeZero(),
-							"device %q %s multiplier = %s, want %s", device.Name, resourceName, m.AllocationMultiplier.String(), exp.AllocationMultiplier.String())
+					case exp.DeviceMultiplier != nil:
+						g.Expect(m.DeviceMultiplier).NotTo(BeNil(), "device %q %s mapping has no DeviceMultiplier", device.Name, resourceName)
+						g.Expect(m.DeviceMultiplier.Cmp(*exp.DeviceMultiplier)).To(BeZero(),
+							"device %q %s multiplier = %s, want %s", device.Name, resourceName, m.DeviceMultiplier.String(), exp.DeviceMultiplier.String())
 					case exp.CapacityKey != nil:
 						g.Expect(m.CapacityKey).NotTo(BeNil(), "device %q %s mapping has no CapacityKey", device.Name, resourceName)
 						g.Expect(*m.CapacityKey).To(Equal(*exp.CapacityKey),
 							"device %q %s capacityKey = %q, want %q", device.Name, resourceName, *m.CapacityKey, *exp.CapacityKey)
 					default:
-						Fail(fmt.Sprintf("expectedMapping for %s must set either AllocationMultiplier or CapacityKey", resourceName))
+						Fail(fmt.Sprintf("expectedMapping for %s must set either DeviceMultiplier or CapacityKey", resourceName))
 					}
 				}
 				matched++
 			}
 		}
 		g.Expect(matched).To(BeNumerically(">", 0),
-			"no devices for driver %q advertise NodeAllocatableResourceMappings yet", driverName)
+			"no devices for driver %q advertise NodeAllocatableResources yet", driverName)
 	}, "60s", "2s").Should(Succeed())
 }
 

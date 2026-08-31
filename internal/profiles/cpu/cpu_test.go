@@ -64,11 +64,14 @@ func TestEnumerateDevices(t *testing.T) {
 		require.True(t, ok, "device %q missing %q capacity entry", device.Name, wantKey)
 		assert.Equal(t, 0, cap.Value.Cmp(wantCPU))
 
-		require.Len(t, device.NodeAllocatableResourceMappings, 1)
-		cpuMapping, ok := device.NodeAllocatableResourceMappings[corev1.ResourceCPU]
+		require.Len(t, device.NodeAllocatableResources, 1)
+		cpuResource, ok := device.NodeAllocatableResources[corev1.ResourceCPU]
 		require.True(t, ok)
-		require.NotNil(t, cpuMapping.CapacityKey)
-		assert.Equal(t, wantKey, *cpuMapping.CapacityKey)
+		require.NotNil(t, cpuResource.Mapping)
+		require.NotNil(t, cpuResource.Mapping.CapacityKey)
+		assert.Equal(t, wantKey, *cpuResource.Mapping.CapacityKey)
+		require.NotNil(t, cpuResource.Mapping.CapacityMultiplier)
+		assert.Equal(t, 0, cpuResource.Mapping.CapacityMultiplier.Cmp(*resource.NewQuantity(1, resource.DecimalSI)))
 	}
 }
 
