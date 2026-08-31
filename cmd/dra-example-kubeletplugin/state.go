@@ -169,6 +169,9 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 		return nil, fmt.Errorf("unable to restore from checkpoint: %v", err)
 	}
 	if restoredDevices != nil {
+		if err = s.cdi.CreateClaimSpecFile(string(claim.UID), restoredDevices); err != nil {
+			return nil, fmt.Errorf("unable to recreate CDI spec file for claim from checkpoint: %v", err)
+		}
 		return restoredDevices, nil
 	}
 

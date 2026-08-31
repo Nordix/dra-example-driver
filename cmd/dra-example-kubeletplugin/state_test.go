@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -32,6 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
+	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
+	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
 	"sigs.k8s.io/dra-example-driver/internal/profiles/cpu"
 )
@@ -307,4 +312,169 @@ func TestUnprepareReturnsErrorOnUnreadableCheckpoint(t *testing.T) {
 	// must not release anything when it cannot read the checkpoint.
 	_, statErr := os.Stat(cdiSpecPath)
 	assert.NoError(t, statErr, "CDI spec file must still be present after Unprepare returns an error")
+}
+
+func TestPrepareRestoredClaimRecreatesMissingClaimSpec(t *testing.T) {
+	const (
+		nodeName   = "test-node"
+		driverName = "cpu.example.com"
+	)
+
+	root := t.TempDir()
+	state := newTestCPUDeviceState(t, root, nodeName, driverName)
+	claim := testCPUClaim(driverName, nodeName)
+
+	prepared, err := state.Prepare(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, prepared)
+	assertClaimSpecResolvesPreparedDevices(t, state, claim.UID, prepared)
+
+	require.NoError(t, os.Remove(claimSpecPath(state, claim.UID)))
+
+	restartedState := newTestCPUDeviceState(t, root, nodeName, driverName)
+	restored, err := restartedState.Prepare(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, restored)
+
+	assert.Equal(t, prepared.GetDevices(), restored.GetDevices())
+	assertClaimSpecResolvesPreparedDevices(t, restartedState, claim.UID, restored)
+
+	checkpoint, err := readCheckpoint(restartedState.checkpointPath, restartedState.checkpointDecoder)
+	require.NoError(t, err)
+	require.Len(t, checkpoint.PreparedClaims, 1)
+	assert.Equal(t, claim.UID, checkpoint.PreparedClaims[0].UID)
+}
+
+func TestPrepareRestoredClaimIsIdempotentWhenClaimSpecExists(t *testing.T) {
+	const (
+		nodeName   = "test-node"
+		driverName = "cpu.example.com"
+	)
+
+	root := t.TempDir()
+	state := newTestCPUDeviceState(t, root, nodeName, driverName)
+	claim := testCPUClaim(driverName, nodeName)
+
+	prepared, err := state.Prepare(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, prepared)
+	assertClaimSpecResolvesPreparedDevices(t, state, claim.UID, prepared)
+
+	restartedState := newTestCPUDeviceState(t, root, nodeName, driverName)
+	restored, err := restartedState.Prepare(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, restored)
+
+	assert.Equal(t, prepared.GetDevices(), restored.GetDevices())
+	assertClaimSpecResolvesPreparedDevices(t, restartedState, claim.UID, restored)
+}
+
+func TestPrepareRestoredClaimFailsWhenClaimSpecCannotBeRecreated(t *testing.T) {
+	const (
+		nodeName   = "test-node"
+		driverName = "cpu.example.com"
+	)
+
+	root := t.TempDir()
+	state := newTestCPUDeviceState(t, root, nodeName, driverName)
+	claim := testCPUClaim(driverName, nodeName)
+
+	_, err := state.Prepare(context.Background(), claim)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Remove(claimSpecPath(state, claim.UID)))
+
+	restartedState := newTestCPUDeviceState(t, root, nodeName, driverName)
+	require.NoError(t, os.Mkdir(claimSpecPath(restartedState, claim.UID), 0750))
+
+	restored, err := restartedState.Prepare(context.Background(), claim)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unable to recreate CDI spec file for claim from checkpoint")
+	assert.Nil(t, restored)
+
+	checkpoint, readErr := readCheckpoint(restartedState.checkpointPath, restartedState.checkpointDecoder)
+	require.NoError(t, readErr)
+	require.Len(t, checkpoint.PreparedClaims, 1)
+	assert.Equal(t, claim.UID, checkpoint.PreparedClaims[0].UID)
+}
+
+func newTestCPUDeviceState(t *testing.T, root, nodeName, driverName string) *DeviceState {
+	t.Helper()
+
+	flags := &Flags{
+		cdiRoot:                     root,
+		driverName:                  driverName,
+		profile:                     "cpu",
+		nodeName:                    nodeName,
+		cpuNUMANodes:                1,
+		cpusPerNUMANode:             4,
+		kubeletPluginsDirectoryPath: root,
+	}
+	require.NoError(t, os.MkdirAll(filepath.Join(root, driverName), 0750))
+
+	state, err := NewDeviceState(&Config{
+		flags:   flags,
+		profile: cpu.NewProfile(nodeName, driverName, flags.cpuNUMANodes, flags.cpusPerNUMANode),
+	})
+	require.NoError(t, err)
+	return state
+}
+
+func testCPUClaim(driverName, nodeName string) *resourceapi.ResourceClaim {
+	return &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "claim-uid",
+			Name:      "claim",
+			Namespace: "default",
+		},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{
+							Request: "cpus",
+							Driver:  driverName,
+							Pool:    nodeName,
+							Device:  "numa-0",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func claimSpecPath(state *DeviceState, claimUID types.UID) string {
+	specName := cdiapi.GenerateTransientSpecName(state.cdi.vendor(), state.cdi.class, string(claimUID))
+	return filepath.Join(filepath.Dir(state.checkpointPath), "..", specName+".yaml")
+}
+
+func assertClaimSpecResolvesPreparedDevices(t *testing.T, state *DeviceState, claimUID types.UID, prepared PreparedDevices) {
+	t.Helper()
+
+	specBytes, err := os.ReadFile(claimSpecPath(state, claimUID))
+	require.NoError(t, err)
+
+	var spec cdispec.Spec
+	require.NoError(t, yaml.Unmarshal(specBytes, &spec))
+	require.Equal(t, state.cdi.kind(), spec.Kind)
+
+	specDevices := map[string]cdispec.Device{}
+	for _, device := range spec.Devices {
+		specDevices[device.Name] = device
+	}
+
+	resolved := 0
+	for _, device := range prepared {
+		for _, cdiDeviceID := range device.CdiDeviceIds {
+			_, _, deviceName, err := cdiparser.ParseQualifiedName(cdiDeviceID)
+			require.NoError(t, err)
+			if deviceName == cdiCommonDeviceName {
+				continue
+			}
+			assert.Contains(t, specDevices, deviceName)
+			resolved++
+		}
+	}
+	assert.Greater(t, resolved, 0, "expected at least one claim-specific CDI device ID")
 }
